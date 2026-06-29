@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+*.db
+.myapp/
+dist/
+build/
+# PyInstaller spec (tracked)
+# *.spec
+.pytest_cache/
+# llama-server binaries (downloaded by get_llama_server.py)
+bin/llama-server
+bin/llama-server.exe
+# PyInstaller output
+dist/
+build/
+*.spec.bak

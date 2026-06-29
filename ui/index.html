@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agentic Workspace</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+
+<body>
+
+    <!-- Sidebar -->
+    <div id="sidebar">
+        <div class="sidebar-header">
+            <h3 id="sidebar-title">Chats</h3>
+            <span onclick="toggleSidebar()">×</span>
+        </div>
+
+        <!-- View: Chats -->
+        <div id="view-chats" class="sidebar-view">
+            <div id="session-list" class="session-list"></div>
+        </div>
+
+        <!-- View: Settings -->
+        <div id="view-settings" class="sidebar-view" style="display:none;">
+            <div class="config-section">
+                <label class="config-label">Provider</label>
+                <div class="custom-dropdown" id="provider-dropdown">
+                    <div class="dropdown-selected" data-value="bonsai" onclick="toggleProviderDropdown()">
+                        <span class="selected-text">🌿 Bonsai 8B (Local)</span>
+                    </div>
+                    <div class="dropdown-options">
+                        <div class="dropdown-option" data-value="openai"
+                            onclick="selectProvider('openai', 'OpenAI')">
+                            OpenAI</div>
+                        <div class="dropdown-option" data-value="anthropic"
+                            onclick="selectProvider('anthropic', 'Anthropic')">
+                            Anthropic</div>
+                        <div class="dropdown-option" data-value="gemini" onclick="selectProvider('gemini', 'Gemini')">
+                            Gemini
+                        </div>
+                        <div class="dropdown-option" data-value="grok" onclick="selectProvider('grok', 'Grok (xAI)')">
+                            Grok
+                            (xAI)</div>
+                        <div class="dropdown-option" data-value="groq" onclick="selectProvider('groq', 'Groq')">Groq
+                        </div>
+                        <div class="dropdown-option" data-value="openrouter"
+                            onclick="selectProvider('openrouter', 'OpenRouter')">OpenRouter</div>
+                        <div class="dropdown-option" data-value="perplexity"
+                            onclick="selectProvider('perplexity', 'Perplexity')">Perplexity</div>
+                        <div class="dropdown-option selected" data-value="bonsai"
+                            onclick="selectProvider('bonsai', '🌿 Bonsai 8B (Local)')">🌿 Bonsai 8B (Local)</div>
+                    </div>
+                </div>
+                <input type="hidden" id="provider-select" value="bonsai">
+
+                <label class="config-label">Model ID (Optional)</label>
+                <input type="text" id="model-input" class="config-input" placeholder="e.g. gpt-4o"
+                    onchange="updateModel()">
+
+                <!-- Cloud provider: API Key input -->
+                <div id="cloud-api-section" style="display:none;">
+                    <label class="config-label">API Key</label>
+                    <input type="password" id="api-key" class="config-input" placeholder="sk-...">
+                    <button class="btn-save" onclick="saveKey()">Save Configuration</button>
+                </div>
+
+                <!-- Local model: Bonsai panel (shown when bonsai is selected) -->
+                <div id="bonsai-panel">
+                    <div class="bonsai-status-bar" id="bonsai-status-bar">
+                        <span id="bonsai-status-dot" class="status-dot status-offline"></span>
+                        <span id="bonsai-status-text">Setting up…</span>
+                    </div>
+                    <button id="btn-bonsai-retry" class="btn-bonsai-retry" style="display:none;"
+                        onclick="retryBonsaiSetup()">↺ Retry</button>
+                </div>
+            </div>
+
+            <hr class="divider">
+
+            <h4 style="margin:0 0 12px 0; font-size:0.9rem; font-weight:600">Knowledge Base</h4>
+            <div id="drop-zone" onclick="document.getElementById('file-input').click()">
+                Drag PDF/CSV here<br>or Click to upload
+            </div>
+            <input type="file" id="file-input" multiple style="display:none" onchange="handleFileSelect(event)">
+            <div id="sidebar-file-list" style="margin-top:12px"></div>
+
+            <button class="btn-clear" onclick="clearRag()">Clear Context</button>
+        </div>
+    </div>
+
+    <!-- Sidebar Toggles -->
+    <div class="sidebar-toggle-group">
+        <!-- Chats Toggle (Hamburger) -->
+        <div class="sidebar-toggle-tab" onclick="toggleSidebar('chats')" id="tab-chats" title="Chats">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                stroke-linecap="round" stroke-linejoin="round">
+                <line x1="3" y1="12" x2="21" y2="12"></line>
+                <line x1="3" y1="6" x2="21" y2="6"></line>
+                <line x1="3" y1="18" x2="21" y2="18"></line>
+            </svg>
+        </div>
+        <!-- Settings Toggle (Key) -->
+        <div class="sidebar-toggle-tab" onclick="toggleSidebar('settings')" id="tab-settings" title="Settings">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                stroke-linecap="round" stroke-linejoin="round">
+                <path
+                    d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4">
+                </path>
+            </svg>
+        </div>
+    </div>
+
+    <!-- Main Content -->
+    <div id="main-content">
+        <div class="header">
+            <div class="logo">Agentic Workspace</div>
+            <div class="header-controls">
+                <button class="new-chat-btn" onclick="newChat()" title="Start a new conversation">+ New Chat</button>
+                <span>Multi-Agent:</span>
+                <input type="checkbox" id="agent-toggle" onchange="toggleAgents()">
+            </div>
+        </div>
+
+        <div id="chat-history"></div>
+
+        <div class="input-container">
+            <div id="file-list"></div>
+            <div class="input-box">
+                <input type="text" id="user-input" placeholder="Ask your agent..." onkeypress="handleEnter(event)">
+                <button class="send-btn" onclick="sendPrompt()">↑</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Checkpoint Sidebar (Right) -->
+    <div id="checkpoint-sidebar">
+        <div class="checkpoint-blocks" id="checkpoint-blocks">
+            <!-- Blocks generated dynamically for each AI answer -->
+        </div>
+    </div>
+
+    <!-- First-run Bonsai setup overlay (shown during model download) -->
+    <div id="bonsai-setup-overlay">
+        <div class="setup-overlay-inner">
+            <div class="setup-leaf">🌿</div>
+            <h2 class="setup-heading">Setting up Bonsai AI</h2>
+            <p class="setup-sub">Downloading the model — this only happens once.<br>After this, Bonsai runs fully offline, forever.</p>
+            <div class="progress-bar-bg setup-progress-bar">
+                <div class="progress-bar-fill" id="setup-overlay-fill" style="width:0%"></div>
+            </div>
+            <div id="setup-overlay-label" class="setup-progress-label">Preparing…</div>
+        </div>
+    </div>
+
+    <!-- Scripts -->
+    <script src="anime.min.js"></script>
+    <script src="marked.min.js"></script>
+    <script src="js/app.js"></script>
+</body>
+
+</html>

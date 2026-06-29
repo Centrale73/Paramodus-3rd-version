@@ -1,0 +1,18 @@
+agno
+aiofiles
+pywebview
+openai
+groq
+anthropic
+google-genai
+pydantic
+python-dotenv
+requests
+pyinstaller
+sqlalchemy
+pypdf
+lancedb
+tantivy
+fastembed
+# Local model support (Bonsai 8B via llama-server)
+huggingface_hub
