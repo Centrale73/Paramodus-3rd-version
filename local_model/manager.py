@@ -1,34 +1,34 @@
 """
 BonsaiManager — lifecycle manager for the Bonsai 8B local model server.
 
-Architecture
-------------
-Bonsai 8B is a 1-bit LLM from PrismML (Apache 2.0).  It ships in two GGUF
-variants relevant to Paramodus:
+Binary + model layout mirrors PrismML-Eng/Bonsai-demo exactly so that
+running `python scripts/setup_bonsai.py` (or the official setup.ps1) is the
+only prerequisite — no extra download step needed.
 
-  bonsai-8b-native  (Q1_0_g128, ~1 GB)
-    Native 1-bit format.  Requires PrismML's llama.cpp fork for the custom
-    CUDA / CPU kernels.  Fastest on GPU; smallest download.
+  Binary resolution order (within the project root):
+    bin/cuda/llama-server.exe   ← CUDA build (setup.ps1 GPU path)
+    bin/hip/llama-server.exe    ← AMD HIP/ROCm build
+    bin/vulkan/llama-server.exe ← Vulkan build
+    bin/cpu/llama-server.exe    ← CPU-only build
+    llama.cpp/build/bin/Release/llama-server.exe  ← locally compiled
+    llama.cpp/build/bin/llama-server.exe
+    ~/.myapp/bin/llama-server.exe  ← legacy fallback
+    system PATH
 
-  bonsai-8b-q4  (Q4_K_M, ~4.6 GB)
-    Unpacked re-quantization by bartowski.  Runs on any standard llama.cpp
-    binary (CPU or GPU).  Best for users without a dedicated GPU.
+  Model resolution order:
+    <project_root>/models/gguf/8B/*.Q1_0*.gguf  ← bonsai (1-bit native)
+    <project_root>/models/gguf/8B/*.gguf        ← any quant fallback
+    ~/.myapp/models/Bonsai-8B.gguf              ← legacy location
 
-The manager downloads the chosen GGUF to ~/.myapp/models/ on first use, then
-starts llama-server as a subprocess on localhost:8080 exposing an
-OpenAI-compatible /v1 endpoint.  Paramodus connects to it via OpenAIChat with
-a custom base_url — no API key required.
-
-Binary resolution order (for llama-server):
-  1. PyInstaller bundle (sys._MEIPASS / sibling exe dir)
-  2. ~/.myapp/bin/llama-server[.exe]   ← placed by scripts/get_llama_server.py
-  3. System PATH
-
-For the .exe distribution, bundle llama-server.exe via paramodus.spec:
-  binaries=[('bin/llama-server.exe', '.')]
+Server flags are taken directly from PrismML's start_llama_server.ps1:
+  --temp 0.5 --top-p 0.85 --top-k 20 --min-p 0
+  --reasoning-budget 0 --reasoning-format none
+  --chat-template-kwargs '{"enable_thinking": false}'
 """
 
 import atexit
+import glob
+import json
 import os
 import sys
 import shutil
@@ -39,16 +39,11 @@ from typing import Callable, Optional
 
 import requests
 
-
 # ---------------------------------------------------------------------------
 # Port utility
 # ---------------------------------------------------------------------------
 
 def _free_port(port: int) -> None:
-    """
-    Kill any process currently listening on *port* so llama-server can bind.
-    Windows-only (uses netstat + taskkill); silently ignored on other platforms.
-    """
     if sys.platform != "win32":
         return
     try:
@@ -57,7 +52,6 @@ def _free_port(port: int) -> None:
             capture_output=True, text=True, timeout=10
         )
         for line in result.stdout.splitlines():
-            # Look for lines like:  TCP  127.0.0.1:8080  ...  LISTENING  <PID>
             if f":{port}" in line and "LISTENING" in line:
                 parts = line.split()
                 pid = int(parts[-1])
@@ -66,13 +60,16 @@ def _free_port(port: int) -> None:
                     capture_output=True, timeout=5
                 )
                 print(f"[BonsaiManager] Freed port {port} — killed PID {pid}")
-                time.sleep(0.5)   # give the OS a moment to release the socket
+                time.sleep(0.5)
     except Exception as exc:
         print(f"[BonsaiManager] Could not free port {port}: {exc}")
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
+
+# Project root = two levels up from this file (local_model/manager.py)
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 APP_DATA   = os.path.join(os.path.expanduser("~"), ".myapp")
 MODELS_DIR = os.path.join(APP_DATA, "models")
@@ -82,84 +79,82 @@ for _d in (APP_DATA, MODELS_DIR, BIN_DIR):
     os.makedirs(_d, exist_ok=True)
 
 # ---------------------------------------------------------------------------
+# PrismML release coordinates (mirrors setup.ps1)
+# ---------------------------------------------------------------------------
+
+PRISM_RELEASE_TAG  = "prism-b8846-d104cf1"
+PRISM_WIN_ASSET_TAG = "prism-b1-d104cf1"          # Windows zip names use this
+PRISM_BASE_URL = (
+    f"https://github.com/PrismML-Eng/llama.cpp/releases/download/{PRISM_RELEASE_TAG}"
+)
+
+# ---------------------------------------------------------------------------
 # Model catalog
 # ---------------------------------------------------------------------------
 
 MODELS: dict[str, dict] = {
     "bonsai-8b-native": {
-        "repo_id":     "prism-ml/Bonsai-8B-gguf",
-        "filename":    "Bonsai-8B.gguf",
-        "hf_url":      "https://huggingface.co/prism-ml/Bonsai-8B-gguf/resolve/main/Bonsai-8B.gguf",
+        "hf_repo":     "prism-ml/Bonsai-8B-gguf",
+        "hf_pattern":  "*Q1_0*.gguf",
+        "local_dir":   os.path.join(_PROJECT_ROOT, "models", "gguf", "8B"),
         "size_gb":     1.15,
         "quant":       "Q1_0_g128 (native 1-bit)",
-        "description": "Native 1-bit (~1.15 GB) — bundled in exe, no download required.",
+        "description": "Native 1-bit (~1.15 GB). Requires PrismML llama.cpp fork.",
         "requires_prismml_fork": True,
     },
     "bonsai-8b-q4": {
-        "repo_id":     "bartowski/prism-ml_Bonsai-8B-unpacked-GGUF",
-        "filename":    "prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf",
-        "hf_url":      (
-            "https://huggingface.co/bartowski/prism-ml_Bonsai-8B-unpacked-GGUF"
-            "/resolve/main/prism-ml_Bonsai-8B-unpacked-Q4_K_M.gguf"
-        ),
+        "hf_repo":     "bartowski/prism-ml_Bonsai-8B-unpacked-GGUF",
+        "hf_pattern":  "*Q4_K_M*.gguf",
+        "local_dir":   os.path.join(_PROJECT_ROOT, "models", "gguf", "8B"),
         "size_gb":     4.6,
         "quant":       "Q4_K_M (unpacked, standard llama.cpp)",
-        "description": "Unpacked Q4_K_M (~4.6 GB) — works with standard llama-server, CPU friendly.",
+        "description": "Unpacked Q4_K_M (~4.6 GB). Works with standard llama-server.",
         "requires_prismml_fork": False,
     },
 }
 
-DEFAULT_MODEL   = "bonsai-8b-native"   # Bundled in exe — zero-config for end users
+DEFAULT_MODEL   = "bonsai-8b-native"
 SERVER_HOST     = "127.0.0.1"
-SERVER_PORT     = 8080
+SERVER_PORT     = 8081
 HEALTH_URL      = f"http://{SERVER_HOST}:{SERVER_PORT}/health"
-CHUNK_SIZE      = 1024 * 256        # 256 KB download chunks
-
 
 # ---------------------------------------------------------------------------
 # BonsaiManager
 # ---------------------------------------------------------------------------
 
 class BonsaiManager:
-    """
-    Manages the download and server lifecycle for Bonsai 8B.
-
-    Thread-safe: start/stop/download can be called from background threads.
-    """
 
     def __init__(self) -> None:
         self._process: Optional[subprocess.Popen] = None
-        self._server_lock  = threading.Lock()
+        self._server_lock   = threading.Lock()
         self._download_lock = threading.Lock()
         self._active_model_key: Optional[str] = None
 
     # ------------------------------------------------------------------
-    # Binary resolution
+    # Binary resolution — mirrors Bonsai-demo start_llama_server.ps1
     # ------------------------------------------------------------------
 
     def _get_llama_server_path(self) -> Optional[str]:
-        """
-        Locate the llama-server executable.  Checks three locations in order:
-
-        1. Bundled inside the PyInstaller .exe directory (sys._MEIPASS or
-           the folder that contains the frozen executable).
-        2. ~/.myapp/bin/  — populated by scripts/get_llama_server.py.
-        3. System PATH.
-        """
         exe = "llama-server.exe" if sys.platform == "win32" else "llama-server"
         candidates: list[str] = []
 
         # 1. PyInstaller bundle
         if getattr(sys, "frozen", False):
-            # _MEIPASS is the temp extraction dir; the binary is extracted there
             candidates.append(os.path.join(sys._MEIPASS, exe))
-            # Also check the folder containing the .exe itself
             candidates.append(os.path.join(os.path.dirname(sys.executable), exe))
 
-        # 2. App-data bin dir (populated by setup script)
+        # 2. Bonsai-demo layout: bin/{cuda,hip,vulkan,cpu}/ relative to project root
+        for subdir in ("cuda", "hip", "vulkan", "cpu"):
+            candidates.append(os.path.join(_PROJECT_ROOT, "bin", subdir, exe))
+
+        # 3. Locally compiled llama.cpp build directories
+        candidates.append(os.path.join(_PROJECT_ROOT, "llama.cpp", "build", "bin", "Release", exe))
+        candidates.append(os.path.join(_PROJECT_ROOT, "llama.cpp", "build", "bin", exe))
+
+        # 4. Legacy ~/.myapp/bin/
         candidates.append(os.path.join(BIN_DIR, exe))
 
-        # 3. System PATH
+        # 5. System PATH
         path_result = shutil.which("llama-server")
         if path_result:
             candidates.append(path_result)
@@ -167,67 +162,59 @@ class BonsaiManager:
         for path in candidates:
             if path and os.path.isfile(path):
                 return path
-
         return None
 
     # ------------------------------------------------------------------
-    # Model info helpers
+    # Model path helpers — mirrors Bonsai-demo model dir layout
     # ------------------------------------------------------------------
 
     def get_model_path(self, model_key: str = DEFAULT_MODEL) -> str:
-        """
-        Resolve the path to the model GGUF file.
+        info = MODELS[model_key]
+        local_dir = info["local_dir"]
+        pattern   = info["hf_pattern"]
 
-        Search order:
-        1. PyInstaller bundle (sys._MEIPASS/models/) — present when running
-           from the compiled .exe.  This is where the pre-bundled model lives.
-        2. ~/.myapp/models/ — downloaded at runtime by the user.
-        """
-        filename = MODELS[model_key]["filename"]
-
-        # 1. PyInstaller frozen exe — check several locations
+        # PyInstaller: check bundle locations first
         if getattr(sys, "frozen", False):
-            candidates = [
-                # _MEIPASS is the _internal/ extraction dir (COLLECT mode)
-                os.path.join(sys._MEIPASS, "models", filename),
-                # Sibling of the .exe itself (in case user moved the model)
-                os.path.join(os.path.dirname(sys.executable), "models", filename),
-                # _internal/models/ via exe path (belt-and-suspenders)
-                os.path.join(os.path.dirname(sys.executable), "_internal", "models", filename),
-            ]
-            for p in candidates:
-                print(f"[BonsaiManager] model lookup: {p} -> {'EXISTS' if os.path.isfile(p) else 'not found'}")
-                if os.path.isfile(p):
-                    return p
+            for base in (sys._MEIPASS, os.path.dirname(sys.executable)):
+                frozen_dir = os.path.join(base, "models", "gguf", "8B")
+                matches = glob.glob(os.path.join(frozen_dir, pattern))
+                if matches:
+                    return matches[0]
 
-        # 2. Fall back to the user's app-data models directory
-        fallback = os.path.join(MODELS_DIR, filename)
-        print(f"[BonsaiManager] model fallback: {fallback} -> {'EXISTS' if os.path.isfile(fallback) else 'not found'}")
-        return fallback
+        # Project-relative Bonsai-demo layout: models/gguf/8B/
+        matches = glob.glob(os.path.join(local_dir, pattern))
+        if matches:
+            return matches[0]
+
+        # Any .gguf in the same dir (alternate quant)
+        any_gguf = glob.glob(os.path.join(local_dir, "*.gguf"))
+        if any_gguf:
+            return any_gguf[0]
+
+        # Legacy ~/.myapp/models/ fallback
+        legacy = os.path.join(MODELS_DIR, "Bonsai-8B.gguf")
+        return legacy
 
     def is_model_downloaded(self, model_key: str = DEFAULT_MODEL) -> bool:
         path = self.get_model_path(model_key)
-        # A partial download leaves a .partial file — don't count it
         return os.path.isfile(path) and not os.path.isfile(path + ".partial")
 
     def get_models(self) -> list[dict]:
-        """Return model catalog enriched with download status."""
         result = []
         for key, info in MODELS.items():
             result.append({
-                "key":         key,
-                "filename":    info["filename"],
-                "size_gb":     info["size_gb"],
-                "quant":       info["quant"],
-                "description": info["description"],
+                "key":          key,
+                "size_gb":      info["size_gb"],
+                "quant":        info["quant"],
+                "description":  info["description"],
                 "requires_prismml_fork": info["requires_prismml_fork"],
-                "downloaded":  self.is_model_downloaded(key),
-                "model_path":  self.get_model_path(key),
+                "downloaded":   self.is_model_downloaded(key),
+                "model_path":   self.get_model_path(key),
             })
         return result
 
     # ------------------------------------------------------------------
-    # Download (streaming, resume-capable)
+    # Download (streaming, resume-capable) — via huggingface_hub
     # ------------------------------------------------------------------
 
     def download_model(
@@ -235,17 +222,6 @@ class BonsaiManager:
         model_key: str = DEFAULT_MODEL,
         progress_cb: Optional[Callable[[float, str], None]] = None,
     ) -> bool:
-        """
-        Download the specified model GGUF from HuggingFace.
-
-        Uses huggingface_hub.hf_hub_download() which correctly handles
-        HuggingFace Xet storage, CDN redirects, and automatic retries.
-        Progress is reported by polling the in-progress file size from a
-        background thread (hf_hub_download is synchronous).
-
-        progress_cb(percent: float, message: str)
-          percent: 0-100 on progress, -1.0 on error
-        """
         with self._download_lock:
             if self.is_model_downloaded(model_key):
                 if progress_cb:
@@ -255,36 +231,27 @@ class BonsaiManager:
             from huggingface_hub import hf_hub_download
 
             info       = MODELS[model_key]
-            dest_path  = self.get_model_path(model_key)
+            local_dir  = info["local_dir"]
+            os.makedirs(local_dir, exist_ok=True)
             total_bytes = int(info["size_gb"] * 1024 ** 3)
 
             if progress_cb:
                 progress_cb(0.0, f"Connecting to HuggingFace… ({info['size_gb']:.1f} GB)")
 
-            # hf_hub_download is blocking; we poll the in-progress cache file
-            # from a side thread to report live progress.
             _stop = threading.Event()
 
             def _poll_progress():
-                """
-                hf_hub_download writes to a .incomplete temp file inside
-                the local_dir while downloading.  We find and stat it.
-                """
                 while not _stop.is_set():
                     try:
-                        # Look for any partial file in MODELS_DIR
-                        for fname in os.listdir(MODELS_DIR):
+                        for fname in os.listdir(local_dir):
                             if fname.endswith(".incomplete") or fname.endswith(".part"):
-                                fpath = os.path.join(MODELS_DIR, fname)
+                                fpath = os.path.join(local_dir, fname)
                                 size  = os.path.getsize(fpath)
                                 if size > 0 and total_bytes > 0 and progress_cb:
                                     pct      = min(size / total_bytes * 100, 99.0)
                                     done_gb  = size / (1024 ** 3)
                                     total_gb = total_bytes / (1024 ** 3)
-                                    progress_cb(
-                                        pct,
-                                        f"Downloading… {done_gb:.2f} / {total_gb:.2f} GB"
-                                    )
+                                    progress_cb(pct, f"Downloading… {done_gb:.2f} / {total_gb:.2f} GB")
                                 break
                     except OSError:
                         pass
@@ -294,14 +261,27 @@ class BonsaiManager:
             monitor.start()
 
             try:
+                # Download only the target quant pattern
+                import fnmatch
+                from huggingface_hub import list_repo_files
+                pattern = info["hf_pattern"]
+                matching = [
+                    f for f in list_repo_files(info["hf_repo"])
+                    if fnmatch.fnmatch(os.path.basename(f), pattern)
+                ]
+                if not matching:
+                    raise FileNotFoundError(
+                        f"No file matching '{pattern}' found in {info['hf_repo']}"
+                    )
+                filename = matching[0]
+
                 hf_hub_download(
-                    repo_id=info["repo_id"],
-                    filename=info["filename"],
-                    local_dir=MODELS_DIR,
+                    repo_id=info["hf_repo"],
+                    filename=filename,
+                    local_dir=local_dir,
                     local_dir_use_symlinks=False,
                 )
                 _stop.set()
-
                 if progress_cb:
                     progress_cb(100.0, "Download complete ✓")
                 return True
@@ -312,11 +292,119 @@ class BonsaiManager:
                     progress_cb(-1.0, f"Download failed: {exc}")
                 return False
 
-    def cancel_download(self, model_key: str = DEFAULT_MODEL) -> None:
-        """Remove the .partial file to start fresh next time."""
-        tmp_path = self.get_model_path(model_key) + ".partial"
-        if os.path.isfile(tmp_path):
-            os.remove(tmp_path)
+    # ------------------------------------------------------------------
+    # Binary download — pulls PrismML's prebuilt llama.cpp fork
+    # ------------------------------------------------------------------
+
+    def download_binary(
+        self,
+        progress_cb: Optional[Callable[[float, str], None]] = None,
+    ) -> bool:
+        """
+        Download the PrismML llama.cpp prebuilt binary for this platform.
+        Mirrors the logic in setup.ps1 section 8.
+        Places the binary under <project_root>/bin/{cuda|cpu}/
+        """
+        import zipfile
+
+        def _report(msg: str):
+            print(f"[BonsaiManager] {msg}")
+            if progress_cb:
+                progress_cb(-1.0, msg)   # -1 = indeterminate progress
+
+        # GPU detection (same as _detect_gpu but returns type string)
+        gpu_type = "cpu"
+        if shutil.which("nvidia-smi"):
+            try:
+                out = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                    timeout=5, stderr=subprocess.DEVNULL,
+                ).decode().strip()
+                if out:
+                    gpu_type = "cuda"
+            except Exception:
+                pass
+
+        if gpu_type == "cpu" and sys.platform == "darwin":
+            import platform as _platform
+            if "arm" in _platform.machine().lower():
+                gpu_type = "metal"   # macOS Metal — no prebuilt zip needed
+
+        # Build asset name (Windows x64 only; Linux/Mac uses build scripts)
+        if sys.platform != "win32":
+            _report("Prebuilt binary download only supported on Windows. "
+                    "On Linux/macOS, run scripts/build_cpu_linux.sh or build_cuda_linux.sh.")
+            return False
+
+        if gpu_type == "cuda":
+            asset   = f"llama-{PRISM_WIN_ASSET_TAG}-bin-win-cuda-12.4-x64.zip"
+            bin_sub = "cuda"
+        else:
+            asset   = f"llama-bin-win-cpu-x64.zip"
+            bin_sub = "cpu"
+
+        bin_dir  = os.path.join(_PROJECT_ROOT, "bin", bin_sub)
+        exe_path = os.path.join(bin_dir, "llama-server.exe")
+        if os.path.isfile(exe_path):
+            _report(f"Binary already present: {exe_path}")
+            if progress_cb:
+                progress_cb(100.0, "Binary already present.")
+            return True
+
+        os.makedirs(bin_dir, exist_ok=True)
+        url     = f"{PRISM_BASE_URL}/{asset}"
+        tmp_zip = os.path.join(bin_dir, "_download.zip")
+
+        _report(f"Downloading {asset} from PrismML release {PRISM_RELEASE_TAG} …")
+        if progress_cb:
+            progress_cb(0.0, f"Downloading {asset}…")
+
+        try:
+            import urllib.request
+            urllib.request.urlretrieve(url, tmp_zip)
+
+            _report(f"Extracting to {bin_dir} …")
+            with zipfile.ZipFile(tmp_zip, "r") as zf:
+                zf.extractall(bin_dir)
+            os.remove(tmp_zip)
+
+            if not os.path.isfile(exe_path):
+                # Binary may be in a sub-folder inside the zip — hoist it up
+                for root, _, files in os.walk(bin_dir):
+                    if "llama-server.exe" in files:
+                        src = os.path.join(root, "llama-server.exe")
+                        if src != exe_path:
+                            shutil.move(src, exe_path)
+                        break
+
+            if os.path.isfile(exe_path):
+                if progress_cb:
+                    progress_cb(100.0, "Binary installed ✓")
+                _report(f"Binary installed: {exe_path}")
+                return True
+            else:
+                _report("Extraction completed but llama-server.exe not found inside zip.")
+                return False
+
+        except Exception as exc:
+            _report(f"Binary download failed: {exc}")
+            if progress_cb:
+                progress_cb(-1.0, f"Binary download failed: {exc}")
+            return False
+
+    # ------------------------------------------------------------------
+    # One-shot setup helper (binary + model)
+    # ------------------------------------------------------------------
+
+    def setup(
+        self,
+        model_key: str = DEFAULT_MODEL,
+        progress_cb: Optional[Callable[[float, str], None]] = None,
+    ) -> bool:
+        """Download the binary and model if not already present."""
+        ok_bin   = self.download_binary(progress_cb=progress_cb)
+        ok_model = self.download_model(model_key=model_key, progress_cb=progress_cb)
+        return ok_bin and ok_model
 
     # ------------------------------------------------------------------
     # Server lifecycle
@@ -331,20 +419,6 @@ class BonsaiManager:
 
     @staticmethod
     def _detect_gpu() -> int:
-        """
-        Return the recommended n_gpu_layers value for this machine.
-
-        - NVIDIA (CUDA): 99  (full offload; driver query via nvidia-smi)
-        - Apple Silicon (Metal): 99  (llama-server uses Metal automatically)
-        - AMD / other GPU:  99  (Vulkan path; llama-server detects it)
-        - CPU-only fallback: 0
-
-        We default to full offload (99) whenever a GPU is plausibly present
-        because llama-server itself won't crash if the GPU can't hold all
-        layers — it simply overflows to CPU.  The user can always override
-        by passing n_gpu_layers explicitly.
-        """
-        # ── NVIDIA via nvidia-smi ────────────────────────────────────────────
         if shutil.which("nvidia-smi"):
             try:
                 out = subprocess.check_output(
@@ -352,53 +426,30 @@ class BonsaiManager:
                     timeout=5, stderr=subprocess.DEVNULL,
                 ).decode().strip()
                 if out:
-                    print(f"[BonsaiManager] NVIDIA GPU detected: {out.splitlines()[0]} — using -ngl 99")
+                    print(f"[BonsaiManager] NVIDIA GPU: {out.splitlines()[0]} — ngl 99")
                     return 99
             except Exception:
                 pass
-
-        # ── Apple Silicon (always has Metal GPU) ─────────────────────────────
         if sys.platform == "darwin":
             import platform as _platform
             if "arm" in _platform.machine().lower():
-                print("[BonsaiManager] Apple Silicon detected — using -ngl 99 (Metal)")
+                print("[BonsaiManager] Apple Silicon — ngl 99 (Metal)")
                 return 99
-
-        # ── CPU-only fallback ────────────────────────────────────────────────
-        print("[BonsaiManager] No discrete GPU detected — running on CPU (-ngl 0)")
+        print("[BonsaiManager] No discrete GPU — CPU only (ngl 0)")
         return 0
 
     def start_server(
         self,
         model_key:      str           = DEFAULT_MODEL,
         n_gpu_layers:   Optional[int] = None,
-        context_length: int           = 4096,
+        context_length: int           = 0,       # 0 = auto-fit (matches Bonsai-demo)
         timeout_s:      int           = 360,
         status_cb:      Optional[Callable[[str], None]] = None,
     ) -> bool:
-        """
-        Start llama-server as a background subprocess.
-
-        Parameters
-        ----------
-        model_key      : Which model variant to load.
-        n_gpu_layers   : GPU layers to offload.  Pass None (default) to
-                         auto-detect the best value for this machine.
-                         Pass 0 to force CPU-only, 99 for full GPU.
-        context_length : Context window in tokens.
-        timeout_s      : Hard timeout in seconds (safety net — normally the
-                         stdout reader detects readiness in seconds, not minutes).
-        status_cb      : Optional callback(line: str) called for every stdout
-                         line emitted by the server during startup.  Useful
-                         for live progress in the UI without polling.
-
-        Returns True once the server reports it is listening.
-        """
         with self._server_lock:
             if self.is_server_running():
                 return True
 
-            # Terminate any tracked process that may have stalled
             if self._process and self._process.poll() is None:
                 self._process.terminate()
                 try:
@@ -407,113 +458,84 @@ class BonsaiManager:
                     self._process.kill()
                 self._process = None
 
-            # Evict any orphaned process holding the port (e.g. from a prior
-            # crashed run that didn't clean up via atexit)
             _free_port(SERVER_PORT)
 
             llama_bin = self._get_llama_server_path()
             if llama_bin is None:
                 print(
                     "[BonsaiManager] llama-server not found.\n"
-                    "  Run: python scripts/get_llama_server.py\n"
+                    "  Run: python scripts/setup_bonsai.py\n"
+                    "  Or run the official setup.ps1 from PrismML-Eng/Bonsai-demo\n"
                     "  Or add llama-server to PATH."
                 )
                 return False
 
             model_path = self.get_model_path(model_key)
-            print(f"[BonsaiManager] Using model: {model_path}")
-            print(f"[BonsaiManager] Model exists: {os.path.isfile(model_path)}")
+            print(f"[BonsaiManager] Model path : {model_path}")
+            print(f"[BonsaiManager] Model found: {os.path.isfile(model_path)}")
             if not os.path.isfile(model_path):
-                print(f"[BonsaiManager] Model not found at {model_path} — download it first.")
-                # List what IS in the expected dirs to help diagnose
-                for check_dir in [
-                    os.path.join(getattr(sys, '_MEIPASS', ''), 'models'),
-                    os.path.join(os.path.dirname(sys.executable), 'models'),
-                    MODELS_DIR,
-                ]:
-                    if os.path.isdir(check_dir):
-                        print(f"[BonsaiManager] Contents of {check_dir}: {os.listdir(check_dir)}")
-                    else:
-                        print(f"[BonsaiManager] Dir not found: {check_dir}")
+                print(f"[BonsaiManager] Model not found — run setup first.")
                 return False
-            print(f"[BonsaiManager] Using binary: {llama_bin}")
 
-            # Auto-detect GPU if not explicitly specified
+            print(f"[BonsaiManager] Binary: {llama_bin}")
+
             if n_gpu_layers is None:
                 n_gpu_layers = self._detect_gpu()
 
+            # chat-template-kwargs must be JSON; PowerShell escaping not needed in Python
+            chat_template_kwargs = json.dumps({"enable_thinking": False})
+
             cmd = [
                 llama_bin,
-                "--model",    model_path,
-                "--host",     SERVER_HOST,
-                "--port",     str(SERVER_PORT),
-                "--ctx-size", str(context_length),
-                "-ngl",       str(n_gpu_layers),
-                # NOTE: do NOT pass --no-mmap here.
-                # --no-mmap forces the entire GGUF into physical RAM at startup,
-                # which is slow and can fail on memory-constrained machines.
-                # The default (mmap) reads pages on demand — faster start, less RAM.
+                "-m",    model_path,
+                "--host", SERVER_HOST,
+                "--port", str(SERVER_PORT),
+                "-ngl",   str(n_gpu_layers),
+                "-c",     str(context_length),   # 0 = auto-fit context
+                "--temp", "0.5",
+                "--top-p", "0.85",
+                "--top-k", "20",
+                "--min-p", "0",
+                "--reasoning-budget", "0",
+                "--reasoning-format", "none",
+                "--chat-template-kwargs", chat_template_kwargs,
             ]
 
             log_path = os.path.join(APP_DATA, "llama_server.log")
 
-            # Hide the console window on Windows (matches your standalone app)
             startupinfo = None
             extra_kwargs: dict = {}
             if sys.platform == "win32":
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 extra_kwargs["startupinfo"] = startupinfo
-                # CREATE_NO_WINDOW is belt-and-suspenders: ensures no window
-                # even if STARTF_USESHOWWINDOW is ignored in some contexts
                 extra_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
             self._process = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,   # capture so we can line-read for readiness
-                stderr=subprocess.STDOUT, # merge stderr → stdout (same as your standalone)
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
-                bufsize=1,                # line-buffered
+                bufsize=1,
                 **extra_kwargs,
             )
             self._active_model_key = model_key
-            atexit.register(self.stop_server)  # extra safety net in case app.py's atexit fires late
+            atexit.register(self.stop_server)
             print(f"[BonsaiManager] Started llama-server pid={self._process.pid} "
                   f"model={model_key} ngl={n_gpu_layers}")
 
-        # ── Readiness detection via stdout line-reader ───────────────────────
-        # This mirrors your standalone app exactly.
-        # We read stdout line-by-line in the calling thread (which is already
-        # a background thread in begin_auto_setup / start_bonsai).
-        # The log file is written in parallel by a drain thread.
         ready    = threading.Event()
         deadline = time.monotonic() + timeout_s
         crashed  = threading.Event()
 
         def _drain_and_detect(proc: subprocess.Popen, log: str) -> None:
-            """
-            Read every line from the server's stdout.
-            - Writes each line to the log file.
-            - Fires status_cb for live UI feedback.
-            - Sets 'ready' when any known ready marker appears OR when the
-              HTTP health endpoint responds (belt-and-suspenders).
-            - Sets 'crashed' if the process exits before becoming ready.
-
-            llama.cpp has changed its ready log line across versions:
-              Older builds : 'llama server listening at http://...'
-              Newer builds : 'server is listening on http://...'
-              JSON log mode: '{"message":"server is listening on"}'
-              PrismML fork : may emit 'HTTP server listening' or similar
-            We match any substring from READY_MARKERS to stay version-safe,
-            and fall back to polling /health if none of the strings match.
-            """
             READY_MARKERS = (
-                "server is listening on",      # llama.cpp >= b3000
-                "llama server listening at",    # llama.cpp older
-                "HTTP server listening",        # some forks
-                "all slots are idle",           # seen in some builds
-                "model loaded",                 # PrismML specific
-                "listening on",                 # catch-all
+                "server is listening on",
+                "llama server listening at",
+                "HTTP server listening",
+                "all slots are idle",
+                "model loaded",
+                "listening on",
             )
             ERROR_MARKERS = (
                 "HTTP server error",
@@ -521,7 +543,6 @@ class BonsaiManager:
                 "address already in use",
                 "error: unable to start",
             )
-
             try:
                 with open(log, "a", buffering=1) as lf:
                     for line in proc.stdout:
@@ -529,25 +550,21 @@ class BonsaiManager:
                         lf.flush()
                         stripped = line.rstrip()
                         print(f"[llama-server] {stripped}")
-
                         if status_cb:
                             try:
                                 status_cb(stripped)
                             except Exception:
                                 pass
-
                         low = line.lower()
                         if any(m.lower() in low for m in READY_MARKERS):
                             ready.set()
-                            # Keep draining so the pipe doesn't block
                         elif any(m.lower() in low for m in ERROR_MARKERS):
-                            print(f"[BonsaiManager] Server reported error: {stripped}")
+                            print(f"[BonsaiManager] Server error: {stripped}")
                             crashed.set()
                             return
             except Exception as exc:
                 print(f"[BonsaiManager] stdout drain error: {exc}")
             finally:
-                # stdout closed = process exited
                 if not ready.is_set():
                     crashed.set()
 
@@ -558,30 +575,25 @@ class BonsaiManager:
         )
         drain_thread.start()
 
-        # Wait for ready or crash, respecting the hard deadline.
-        # Also poll /health every 2 s as a fallback — catches builds where
-        # llama-server uses structured JSON logging and never emits a
-        # plain-text ready line that matches our READY_MARKERS.
         _last_health_check = time.monotonic()
         while not ready.is_set() and not crashed.is_set():
             if time.monotonic() > deadline:
-                print("[BonsaiManager] Timed out waiting for server to become ready.")
+                print("[BonsaiManager] Timed out waiting for server.")
                 self.stop_server()
                 return False
-            # Health poll fallback every 2 s
             if time.monotonic() - _last_health_check >= 2.0:
                 _last_health_check = time.monotonic()
                 if self.is_server_running():
-                    print("[BonsaiManager] /health responded — server is ready (log marker not matched)")
+                    print("[BonsaiManager] /health responded — server ready")
                     ready.set()
                     break
-            time.sleep(0.1)  # 100 ms tick
+            time.sleep(0.1)
 
         if ready.is_set():
             print(f"[BonsaiManager] Server ready at http://{SERVER_HOST}:{SERVER_PORT}/v1")
             return True
 
-        print("[BonsaiManager] llama-server exited unexpectedly — check ~/.myapp/llama_server.log")
+        print("[BonsaiManager] llama-server exited — check ~/.myapp/llama_server.log")
         return False
 
     def stop_server(self) -> None:
@@ -603,20 +615,19 @@ class BonsaiManager:
     def get_status(self, model_key: str = DEFAULT_MODEL) -> dict:
         llama_bin = self._get_llama_server_path()
         return {
-            "model_key":       model_key,
+            "model_key":        model_key,
             "model_downloaded": self.is_model_downloaded(model_key),
-            "partial_exists":  os.path.isfile(self.get_model_path(model_key) + ".partial"),
-            "server_running":  self.is_server_running(),
-            "active_model":    self._active_model_key,
-            "model_path":      self.get_model_path(model_key),
-            "server_url":      f"http://{SERVER_HOST}:{SERVER_PORT}/v1",
-            "binary_found":    llama_bin is not None,
-            "binary_path":     llama_bin,
+            "server_running":   self.is_server_running(),
+            "active_model":     self._active_model_key,
+            "model_path":       self.get_model_path(model_key),
+            "server_url":       f"http://{SERVER_HOST}:{SERVER_PORT}/v1",
+            "binary_found":     llama_bin is not None,
+            "binary_path":      llama_bin,
         }
 
 
 # ---------------------------------------------------------------------------
-# Module-level singleton — import this everywhere
+# Module-level singleton
 # ---------------------------------------------------------------------------
 
 bonsai = BonsaiManager()
