@@ -6,9 +6,58 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Agentic Workspace</title>
     <link rel="stylesheet" href="css/style.css">
+    <style>
+        /* Backend init loading overlay — shown while Python background thread
+           is still importing agno / fastembed / lancedb.
+           Hidden automatically once get_init_status() returns ready:true.     */
+        #backend-loading-overlay {
+            position: fixed;
+            inset: 0;
+            background: #180079;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 18px;
+            z-index: 99999;
+            color: #fff;
+            font-family: inherit;
+            transition: opacity 0.4s ease;
+        }
+        #backend-loading-overlay.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+        .backend-spinner {
+            width: 42px;
+            height: 42px;
+            border: 4px solid rgba(255,255,255,0.2);
+            border-top-color: #fff;
+            border-radius: 50%;
+            animation: spin 0.9s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .backend-loading-title {
+            font-size: 1.2rem;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+        }
+        .backend-loading-sub {
+            font-size: 0.82rem;
+            opacity: 0.6;
+        }
+    </style>
 </head>
 
 <body>
+
+    <!-- Backend init gate — dismisses itself once Python signals ready -->
+    <div id="backend-loading-overlay">
+        <div class="setup-leaf" style="font-size:2.4rem">🌿</div>
+        <div class="backend-spinner"></div>
+        <div class="backend-loading-title">Starting Agentic Workspace…</div>
+        <div class="backend-loading-sub" id="backend-loading-sub">Loading AI libraries…</div>
+    </div>
 
     <!-- Sidebar -->
     <div id="sidebar">
@@ -158,6 +207,56 @@
     <script src="anime.min.js"></script>
     <script src="marked.min.js"></script>
     <script src="js/app.js"></script>
+
+    <!-- Backend readiness gate
+         Polls get_init_status() every 500 ms after pywebviewready fires.
+         Only once Python signals ready:true does it:
+           1. Fade out and remove #backend-loading-overlay
+           2. Call window.onBackendReady() so app.js can run begin_auto_setup
+              and any other startup logic that requires the Python bridge.
+         This prevents the grey "Not Responding" freeze caused by JS calling
+         bridge methods before agno/fastembed/lancedb have finished importing.
+    -->
+    <script>
+        window.addEventListener('pywebviewready', function () {
+            const overlay  = document.getElementById('backend-loading-overlay');
+            const subLabel = document.getElementById('backend-loading-sub');
+            const dots     = ['Loading AI libraries…', 'Importing agents…', 'Almost ready…'];
+            let   dotIdx   = 0;
+
+            // Cycle the sub-label text so the user knows it is still working
+            const textTimer = setInterval(function () {
+                dotIdx = (dotIdx + 1) % dots.length;
+                if (subLabel) subLabel.textContent = dots[dotIdx];
+            }, 2000);
+
+            // Poll until Python background init is done
+            const poll = setInterval(async function () {
+                try {
+                    const status = await window.pywebview.api.get_init_status();
+                    if (status && status.ready) {
+                        clearInterval(poll);
+                        clearInterval(textTimer);
+
+                        // Fade out the overlay
+                        if (overlay) {
+                            overlay.classList.add('hidden');
+                            setTimeout(function () {
+                                overlay.style.display = 'none';
+                            }, 450);
+                        }
+
+                        // Notify app.js that the bridge is fully available
+                        if (typeof window.onBackendReady === 'function') {
+                            window.onBackendReady();
+                        }
+                    }
+                } catch (e) {
+                    // Bridge not ready yet — keep polling
+                }
+            }, 500);
+        });
+    </script>
 </body>
 
 </html>
