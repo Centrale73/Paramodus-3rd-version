@@ -10,7 +10,21 @@ import uuid
 # window appear frozen before it even renders.
 # Instead, they are imported lazily inside the methods that need them,
 # by which point the background init thread in app.py has already loaded them.
-from local_model.manager import bonsai, DEFAULT_MODEL
+#
+# FIX 3 (continued): bonsai is also lazy now — importing local_model.manager
+# at module level was running on the main thread and delaying window creation.
+
+
+def _bonsai():
+    """Lazy import of the BonsaiManager singleton."""
+    from local_model.manager import bonsai
+    return bonsai
+
+
+def _default_model():
+    """Lazy import of DEFAULT_MODEL constant."""
+    from local_model.manager import DEFAULT_MODEL
+    return DEFAULT_MODEL
 
 
 def _agent_module():
@@ -23,6 +37,7 @@ def _db_module():
     """Lazy import of database functions."""
     from database import save_msg, get_history, clear_session, get_all_sessions
     return save_msg, get_history, clear_session, get_all_sessions
+
 
 class ApiBridge:
     def __init__(self):
@@ -47,9 +62,31 @@ class ApiBridge:
         self.uploaded_filenames = []
         # Session management
         self.current_session_id = str(uuid.uuid4())
+        # FIX 4: set by app.py once _background_init() completes
+        self._init_done: threading.Event = threading.Event()
 
     def set_window(self, window):
         self.window = window
+
+    def set_init_event(self, event: threading.Event):
+        """Called by app.py to hand off the _init_done event (FIX 4)."""
+        self._init_done = event
+
+    def _is_ready(self) -> bool:
+        """True once background init has finished."""
+        return self._init_done.is_set()
+
+    # ------------------------------------------------------------------
+    # Readiness probe — called by JS polling loop on pywebviewready
+    # ------------------------------------------------------------------
+
+    def get_init_status(self) -> dict:
+        """
+        Non-blocking readiness probe for JS.
+        JS polls this every 500 ms until ready == True, then removes
+        the loading overlay and enables the full UI.
+        """
+        return {"ready": self._is_ready()}
 
     def new_session(self):
         """Start a new conversation session."""
@@ -87,19 +124,21 @@ class ApiBridge:
     # Local Model (Bonsai 8B)
     # ------------------------------------------------------------------
 
-    def get_local_model_status(self, model_key: str = DEFAULT_MODEL) -> dict:
+    def get_local_model_status(self, model_key: str = None) -> dict:
         """Return the current download + server status for a Bonsai model variant."""
-        return bonsai.get_status(model_key)
+        return _bonsai().get_status(model_key or _default_model())
 
     def get_bonsai_models(self) -> list:
         """Return the full model catalog with per-variant download state."""
-        return bonsai.get_models()
+        return _bonsai().get_models()
 
-    def download_bonsai(self, model_key: str = DEFAULT_MODEL) -> dict:
+    def download_bonsai(self, model_key: str = None) -> dict:
         """
         Start a background download of the chosen Bonsai variant.
         Progress is streamed back to the frontend via updateDownloadProgress().
         """
+        _key = model_key or _default_model()
+
         def _worker():
             def _cb(pct: float, msg: str):
                 if self.window:
@@ -107,27 +146,27 @@ class ApiBridge:
                     self.window.evaluate_js(
                         f"updateDownloadProgress({pct:.2f}, {safe_msg})"
                     )
-            bonsai.download_model(model_key=model_key, progress_cb=_cb)
+            _bonsai().download_model(model_key=_key, progress_cb=_cb)
 
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
-        return {"status": "started", "model_key": model_key}
+        return {"status": "started", "model_key": _key}
 
-    def cancel_download_bonsai(self, model_key: str = DEFAULT_MODEL) -> dict:
+    def cancel_download_bonsai(self, model_key: str = None) -> dict:
         """Cancel an in-progress download (removes the .partial file)."""
-        bonsai.cancel_download(model_key)
+        _bonsai().cancel_download(model_key or _default_model())
         return {"status": "cancelled"}
 
-    def start_bonsai(self, model_key: str = DEFAULT_MODEL, n_gpu_layers: int = 0) -> dict:
+    def start_bonsai(self, model_key: str = None, n_gpu_layers: int = 0) -> dict:
         """
         Start llama-server in the background.
         Calls onBonsaiServerReady(true/false) on the frontend when done.
         """
+        _key = model_key or _default_model()
+
         def _worker():
-            # n_gpu_layers=None triggers auto-detection in BonsaiManager._detect_gpu()
-            # The n_gpu_layers param from the UI is used only if explicitly != -1
             effective_ngl = n_gpu_layers if n_gpu_layers >= 0 else None
-            ok = bonsai.start_server(model_key=model_key, n_gpu_layers=effective_ngl)
+            ok = _bonsai().start_server(model_key=_key, n_gpu_layers=effective_ngl)
             if self.window:
                 self.window.evaluate_js(f"onBonsaiServerReady({'true' if ok else 'false'})")
 
@@ -137,15 +176,23 @@ class ApiBridge:
 
     def stop_bonsai(self) -> dict:
         """Stop the running llama-server process."""
-        bonsai.stop_server()
+        _bonsai().stop_server()
         return {"status": "stopped"}
 
-    def begin_auto_setup(self, model_key: str = DEFAULT_MODEL) -> dict:
+    def begin_auto_setup(self, model_key: str = None) -> dict:
         """
         Zero-click Bonsai setup — called automatically by the frontend.
         Chains: binary check → download (if needed) → server start.
         All progress is reported back via onBonsaiSetupProgress(phase, pct, msg).
+
+        FIX 4: returns {"status": "initializing"} immediately if background
+        init is not yet complete, so this method never blocks the GUI thread.
         """
+        if not self._is_ready():
+            return {"status": "initializing", "message": "Backend is still loading, please wait..."}
+
+        _key = model_key or _default_model()
+
         def _report(phase: str, pct: float, msg: str):
             if self.window:
                 self.window.evaluate_js(
@@ -153,35 +200,30 @@ class ApiBridge:
                 )
 
         def _worker():
-            # ── 1. Binary check ──────────────────────────────────────────────
-            if not bonsai._get_llama_server_path():
+            b = _bonsai()
+            # ── 1. Binary check ───────────────────────────────────────────────
+            if not b._get_llama_server_path():
                 _report('error', -1,
                     'llama-server not found — rebuild the exe with PyInstaller.')
                 return
 
-            # ── 2. Download model if not already on disk ─────────────────────
-            if not bonsai.is_model_downloaded(model_key):
+            # ── 2. Download model if not already on disk ────────────────────
+            if not b.is_model_downloaded(_key):
                 def _dl_cb(pct: float, msg: str):
                     _report('downloading', pct, msg)
-
-                ok = bonsai.download_model(model_key=model_key, progress_cb=_dl_cb)
+                ok = b.download_model(model_key=_key, progress_cb=_dl_cb)
                 if not ok:
-                    # Error message already sent by _dl_cb with the real exception
                     return
 
             # ── 3. Start server ──────────────────────────────────────────────
             _report('starting', 0, 'Loading model into memory…')
 
-            # Feed live stdout lines from llama-server to the UI overlay so
-            # users see real progress (layer counts, tensor loading, etc.)
             def _server_line_cb(line: str) -> None:
-                # Only forward lines that look like meaningful load progress;
-                # skip empty lines and very short ones
                 stripped = line.strip()
                 if len(stripped) > 5:
                     _report('starting', 0, stripped[:90])
 
-            ok = bonsai.start_server(model_key=model_key, status_cb=_server_line_cb)
+            ok = b.start_server(model_key=_key, status_cb=_server_line_cb)
             if ok:
                 _report('ready', 100, 'Bonsai is ready')
             else:
@@ -189,7 +231,7 @@ class ApiBridge:
                     'Server failed to start — check ~/.myapp/llama_server.log')
 
         threading.Thread(target=_worker, daemon=True).start()
-        return {"status": "started", "model_key": model_key}
+        return {"status": "started", "model_key": _key}
 
     def set_model(self, model_id):
         self.current_model = model_id if model_id else None
@@ -220,8 +262,7 @@ class ApiBridge:
                 data = base64.b64decode(content_b64)
                 processed_files.append({"name": name, "data": data})
                 self.uploaded_filenames.append(name)
-            
-            # Use the global ingestion function from workspace_agent
+
             success = _agent_module().ingest_files(processed_files)
             if success:
                 return {"status": "success", "files": list(set(self.uploaded_filenames))}
@@ -234,7 +275,7 @@ class ApiBridge:
         if not api_key:
             self.window.evaluate_js(f"receiveError('Please set your {self.current_provider.title()} API Key first.')")
             return
-         
+
         if not target_id:
             save_msg, _, _, _ = _db_module()
             save_msg("user", user_text, self.current_session_id)
@@ -254,17 +295,17 @@ class ApiBridge:
             provider = self.current_provider
             api_key = self.keys.get(provider)
             model_id = self.current_model
-            
+
             agent = _agent_module().get_agent(
-                provider=provider, 
-                api_key=api_key, 
-                model_id=model_id, 
+                provider=provider,
+                api_key=api_key,
+                model_id=model_id,
                 user_id="default_user",
                 session_id=self.current_session_id
             )
             full_response = ""
             run_response = agent.run(user_text, stream=True)
-            
+
             if target_id:
                 self.window.evaluate_js(f"clearBubble('{target_id}')")
 
@@ -276,60 +317,40 @@ class ApiBridge:
 
             save_msg, _, _, _ = _db_module()
             save_msg("bot", full_response, self.current_session_id)
-            
-            # GenUI: Detect tone from response
+
             tone = self._detect_tone(full_response)
             self.window.evaluate_js(f"streamComplete({json.dumps(tone)})")
         except Exception as e:
             self.window.evaluate_js(f"receiveError({json.dumps(str(e))})")
-    
+
     def _detect_tone(self, text):
         """
         Simple keyword-based tone detection for GenUI.
         Returns: 'calm', 'excited', 'serious', or 'playful'
         """
         text_lower = text.lower()
-        
-        # Score each tone based on keyword presence
-        scores = {
-            'excited': 0,
-            'playful': 0,
-            'serious': 0,
-            'calm': 0
-        }
-        
-        # Excited indicators
-        excited_words = ['!', 'amazing', 'awesome', 'fantastic', 'great', 'excellent', 
-                        'wonderful', 'exciting', 'incredible', 'brilliant', 'love']
-        for word in excited_words:
+        scores = {'excited': 0, 'playful': 0, 'serious': 0, 'calm': 0}
+
+        for word in ['!', 'amazing', 'awesome', 'fantastic', 'great', 'excellent',
+                     'wonderful', 'exciting', 'incredible', 'brilliant', 'love']:
             scores['excited'] += text_lower.count(word)
-        
-        # Playful indicators
-        playful_words = ['😊', '😄', '🎉', 'haha', 'fun', 'enjoy', 'play', 'joke', 
-                        'funny', 'silly', 'cool', '👍', '✨']
-        for word in playful_words:
+
+        for word in ['\U0001f60a', '\U0001f604', '\U0001f389', 'haha', 'fun', 'enjoy',
+                     'play', 'joke', 'funny', 'silly', 'cool', '\U0001f44d', '\u2728']:
             scores['playful'] += text_lower.count(word)
-        
-        # Serious indicators
-        serious_words = ['important', 'critical', 'warning', 'caution', 'error',
-                        'must', 'should', 'require', 'necessary', 'essential',
-                        'security', 'risk', 'issue', 'problem', 'careful']
-        for word in serious_words:
+
+        for word in ['important', 'critical', 'warning', 'caution', 'error',
+                     'must', 'should', 'require', 'necessary', 'essential',
+                     'security', 'risk', 'issue', 'problem', 'careful']:
             scores['serious'] += text_lower.count(word)
-        
-        # Calm indicators (gentle, instructional)
-        calm_words = ['here', 'let me', 'simply', 'just', 'easy', 'step', 'guide',
-                     'help', 'explain', 'understand', 'note', 'consider']
-        for word in calm_words:
+
+        for word in ['here', 'let me', 'simply', 'just', 'easy', 'step', 'guide',
+                     'help', 'explain', 'understand', 'note', 'consider']:
             scores['calm'] += text_lower.count(word)
-        
-        # Return the highest scoring tone, default to 'calm'
+
         if max(scores.values()) == 0:
             return 'calm'
-        
         return max(scores, key=scores.get)
 
     def _run_multi_agent(self, user_text, target_id):
-        # Placeholder for multi-agent support if needed, but keeping it simple for now
         self._run_single_agent(user_text, target_id)
-
