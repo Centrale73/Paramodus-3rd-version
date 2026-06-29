@@ -9,42 +9,44 @@ Startup sequence
    - Import workspace_agent (pulls in agno, torch, fastembed, etc.)
    - begin_auto_setup (download model if needed + start llama-server)
 3. The JS side calls begin_auto_setup() via pywebview API only after
-   pywebviewready fires, by which point the window is already visible.
-
-Why: PyInstaller frozen exes decompress hundreds of .pyc files from
-_MEIPASS on first import.  Heavy libraries (agno, torch, fastembed,
-lancedb) can take 20-60 seconds.  Running them on the main thread
-makes the window appear frozen/unresponsive until they finish.
+   onBackendReady fires (polled from index.html), by which point the
+   window is already visible and the bridge is fully initialised.
 
 Fixes applied
 -------------
-FIX 1 — sys.excepthook patch (safety net):
-    pythonnet 3.x reflects WebView2's AccessibilityObject.Bounds.Empty
+FIX 1 — sys.excepthook + threading.excepthook patch (safety net):
+    pythonnet 3.x reflects WebView2’s AccessibilityObject.Bounds.Empty
     struct recursively until Python hits RecursionError.  We intercept
-    RecursionError silently at the top-level excepthook so it never
-    crashes the process.  setrecursionlimit(2000) gives extra breathing
-    room without blowing the real stack.
+    RecursionError silently at BOTH the top-level excepthook AND the
+    per-thread excepthook (threading.excepthook) introduced in Python 3.8.
+    This covers the case where the error fires on the .NET worker thread
+    that manages the WebView2 COM controller, not the main thread.
+    setrecursionlimit(2000) gives extra breathing room.
 
-FIX 2 — WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS env var:
-    Passes --disable-renderer-accessibility to the WebView2 runtime
-    before webview.start() so the COM accessibility tree is never
-    exposed — prevents the pythonnet reflection from being triggered
-    in the first place.  Belt-and-suspenders with FIX 1.
+FIX 2 — Three WebView2 env vars to disable accessibility COM tree:
+    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: --disable-renderer-accessibility
+        Disables the Blink/renderer-side accessibility tree.
+    WEBVIEW2_RELEASE_CHANNEL_PREFERENCE: 0
+        Pins channel so the env var is respected by the loader.
+    WEBVIEW2_WIN32_COREWEBVIEW2CONTROLLER_OPTIONS: AllowExternalDrop=0
+        Disables AllowExternalDrop on the COM controller, which is the
+        second error in the log (CoreWebView2Controller.get_AllowExternalDrop
+        failing via E_NOINTERFACE on cross-thread COM call).
+    These must be set before `import webview`.
 
-FIX 3 — lazy bonsai import on main thread:
-    The top-level `from local_model.manager import bonsai` ran on the
-    main thread before the window was created, blocking GUI startup.
-    Moved to a lazy import inside _on_exit() and a local reference
-    inside __main__ only when strictly needed.
+FIX 3 — lazy bonsai import:
+    Moved `from local_model.manager import bonsai` out of module-level
+    into _on_exit() so it never runs on the main thread at startup.
 
-FIX 4 — _background_init signals completion via threading.Event:
-    _init_done is set once all heavy imports finish.  ApiBridge methods
-    called by JS immediately after pywebviewready now return a safe
-    {"status": "initializing"} dict instead of blocking or crashing.
+FIX 4 — _init_done threading.Event:
+    Signals the JS bridge when all heavy background imports finish.
+    JS polls get_init_status() every 500ms (index.html) and only calls
+    bridge methods after ready:true is returned.
 """
 
-# ── FIX 1: patch excepthook BEFORE any other import ─────────────────────────
+# ── FIX 1: patch BOTH excepthooks BEFORE any other import ────────────────────
 import sys
+import threading
 
 sys.setrecursionlimit(2000)  # default 1000 is too tight for pythonnet reflection
 
@@ -54,23 +56,42 @@ _orig_excepthook = sys.excepthook
 def _safe_excepthook(exc_type, exc_value, exc_tb):
     """Silently swallow the pywebview/pythonnet AccessibilityObject recursion bug."""
     if exc_type is RecursionError:
-        # Always caused by pythonnet reflecting WebView2 accessibility structs.
-        # Log once so it is still visible in dev, then suppress.
         print("[app] Suppressed RecursionError (pywebview/pythonnet a11y bug)")
         return
     _orig_excepthook(exc_type, exc_value, exc_tb)
 
 
 sys.excepthook = _safe_excepthook
+
+
+# Python 3.8+: also patch the per-thread hook so errors on .NET worker
+# threads (where the WebView2 COM controller lives) are also suppressed.
+def _safe_thread_excepthook(args):
+    if args.exc_type is RecursionError:
+        print("[app] Suppressed RecursionError on thread (pywebview/pythonnet a11y bug)")
+        return
+    # Fall back to default behaviour for everything else
+    threading.__excepthook__(args)  # built-in default handler
+
+
+threading.excepthook = _safe_thread_excepthook
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── FIX 2: disable WebView2 accessibility BEFORE webview is imported ─────────
+# ── FIX 2: disable WebView2 accessibility + AllowExternalDrop BEFORE import ───
 import os
+
+# Disable Blink/renderer accessibility tree
 os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = "--disable-renderer-accessibility"
+
+# Disable AllowExternalDrop on the COM controller (fixes the second error:
+# CoreWebView2Controller.get_AllowExternalDrop E_NOINTERFACE on cross-thread call)
+os.environ["WEBVIEW2_WIN32_COREWEBVIEW2CONTROLLER_OPTIONS"] = "AllowExternalDrop=0"
+
+# Pin release channel so both vars are respected by the runtime loader
+os.environ["WEBVIEW2_RELEASE_CHANNEL_PREFERENCE"] = "0"
 # ─────────────────────────────────────────────────────────────────────────────
 
 import atexit
-import threading
 
 import webview
 from dotenv import load_dotenv
